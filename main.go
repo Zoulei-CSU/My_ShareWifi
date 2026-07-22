@@ -48,6 +48,8 @@ type Config struct {
 	DHCPEnd           string `json:"dhcp_end"`
 	LeaseTime         string `json:"lease_time"`
 	UpstreamInterface string `json:"upstream_interface"`
+	AllowUpstreamLAN  bool   `json:"allow_upstream_lan"`
+	UpstreamLANCIDR   string `json:"upstream_lan_cidr"`
 }
 
 type Check struct {
@@ -405,6 +407,12 @@ func validate(c Config) error {
 	if c.UpstreamInterface != "" && strings.ContainsAny(c.UpstreamInterface, " /\t\n") {
 		return errors.New("invalid upstream interface")
 	}
+	if c.AllowUpstreamLAN {
+		upstreamIP, upstreamNet, err := net.ParseCIDR(c.UpstreamLANCIDR)
+		if err != nil || upstreamIP.To4() == nil || upstreamNet.IP.To4() == nil {
+			return errors.New("upstream LAN must be an IPv4 CIDR such as 172.16.41.0/24")
+		}
+	}
 	return nil
 }
 
@@ -675,10 +683,15 @@ func (a *app) addFirewall(c Config) error {
 		// nft requires a statement separator between chain declarations.  Use a
 		// multiline ruleset rather than compacting it into one line: besides being
 		// valid for nft, it makes an error printed by nft directly actionable.
+		allowUpstream := ""
+		if c.AllowUpstreamLAN {
+			allowUpstream = fmt.Sprintf("    iifname %q oifname %q ip saddr %s ip daddr %s accept\\n", c.UpstreamInterface, c.Interface, c.UpstreamLANCIDR, subnet)
+		}
 		script := fmt.Sprintf(`table ip sharewifi {
   chain forward {
     type filter hook forward priority 0;
     iifname "%s" oifname "%s" accept
+%s
     iifname "%s" oifname "%s" ct state established,related accept
   }
   chain postrouting {
@@ -686,7 +699,7 @@ func (a *app) addFirewall(c Config) error {
     oifname "%s" ip saddr %s masquerade
   }
 }
-`, c.Interface, c.UpstreamInterface, c.UpstreamInterface, c.Interface, c.UpstreamInterface, subnet)
+`, c.Interface, c.UpstreamInterface, allowUpstream, c.UpstreamInterface, c.Interface, c.UpstreamInterface, subnet)
 		return runInput(script, "nft", "-f", "-")
 	}
 	if err := run("iptables", "-A", "FORWARD", "-i", c.Interface, "-o", c.UpstreamInterface, "-j", "ACCEPT"); err != nil {
@@ -694,6 +707,11 @@ func (a *app) addFirewall(c Config) error {
 	}
 	if err := run("iptables", "-A", "FORWARD", "-i", c.UpstreamInterface, "-o", c.Interface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"); err != nil {
 		return err
+	}
+	if c.AllowUpstreamLAN {
+		if err := run("iptables", "-A", "FORWARD", "-i", c.UpstreamInterface, "-o", c.Interface, "-s", c.UpstreamLANCIDR, "-d", subnet, "-j", "ACCEPT"); err != nil {
+			return err
+		}
 	}
 	return run("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnet, "-o", c.UpstreamInterface, "-j", "MASQUERADE")
 }
@@ -703,6 +721,9 @@ func (a *app) removeFirewall(c Config) {
 	} else {
 		_ = run("iptables", "-D", "FORWARD", "-i", c.Interface, "-o", c.UpstreamInterface, "-j", "ACCEPT")
 		_ = run("iptables", "-D", "FORWARD", "-i", c.UpstreamInterface, "-o", c.Interface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+		if c.AllowUpstreamLAN {
+			_ = run("iptables", "-D", "FORWARD", "-i", c.UpstreamInterface, "-o", c.Interface, "-s", c.UpstreamLANCIDR, "-d", subnet(c.GatewayCIDR), "-j", "ACCEPT")
+		}
 		_ = run("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnet(c.GatewayCIDR), "-o", c.UpstreamInterface, "-j", "MASQUERADE")
 	}
 }

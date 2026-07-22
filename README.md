@@ -83,6 +83,8 @@ sudo ./sharewifi --config /etc/sharewifi/home.json \
   --listen 127.0.0.1:8080 \
   --workdir /var/lib/sharewifi \
   --username admin --password 'replace-this-password'
+
+sudo ./sharewifi -listen 0.0.0.0:8081 -username zoulei -password admin123 -workdir /home/zouleid/tmp -config /home/zouleid/tmp/sharewifi.json
 ```
 
 `--config` 仅读取热点和 DHCP 参数；`--listen`、`--workdir`、`--username`、`--password` 是进程级参数，不会写入 JSON，可以与 `--config` 同时使用。
@@ -101,11 +103,15 @@ sudo ./sharewifi --config /etc/sharewifi/home.json \
   "dhcp_start": "192.168.50.20",
   "dhcp_end": "192.168.50.200",
   "lease_time": "12h",
-  "upstream_interface": ""
+  "upstream_interface": "",
+  "allow_upstream_lan": false,
+  "upstream_lan_cidr": ""
 }
 ```
 
 `upstream_interface` 为空时使用系统默认 IPv4 路由对应的接口。
+
+`allow_upstream_lan` 默认关闭。启用后，程序仅允许 `upstream_lan_cidr` 指定的上游 IPv4 网段主动访问热点网段。例如主机上游地址为 `172.16.41.50/24`、热点网段为 `192.168.50.0/24` 时，填写 `172.16.41.0/24`。上游设备还必须具有到热点网段的路由，例如在 `172.16.41.40` 上执行：`sudo ip route replace 192.168.50.0/24 via 172.16.41.50`。
 
 ## 设计与运行机制
 
@@ -128,7 +134,7 @@ sudo ./sharewifi --config /etc/sharewifi/home.json \
 
 - 创建热点前会对 AP 网卡执行 `ip addr flush`。不要将当前管理连接依赖在这张网卡上，否则会断网。
 - 本程序只管理 IPv4 NAT，不支持桥接、IPv6 转发、开放网络、WPA Enterprise、多 AP 实例或带宽限速。
-- `nftables` 使用专属 `table ip sharewifi`；`iptables` 只添加并删除三条精确规则。若其他防火墙工具（如 firewalld、ufw）阻断转发，仍需按系统策略额外处理。
+- `nftables` 使用专属 `table ip sharewifi`；`iptables` 只添加并删除精确规则。若其他防火墙工具（如 firewalld、ufw）阻断转发，仍需按系统策略额外处理。
 - 正常使用页面“停止”、`Ctrl+C` 或 `SIGTERM` 退出会执行清理。`kill -9`、崩溃或意外断电可能遗留 hostapd、dnsmasq、接口地址和防火墙规则。
 - 当前第一阶段没有持久化运行状态和遗留会话接管能力。异常退出后重新启动的程序不能自动识别并停止旧热点；此时请先人工检查并清理遗留进程与规则。
 - 程序不会自动安装系统包，也不会绕过地区无线监管限制。实际可用信道由国家代码、网卡和驱动决定。

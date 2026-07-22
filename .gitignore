@@ -1,0 +1,21 @@
+# Go build outputs
+sharewifi
+sharewifi.exe
+*.test
+*.prof
+coverage.out
+dist/
+
+# Runtime files; use a separate --workdir outside the repository when possible.
+hostapd.conf
+dnsmasq.conf
+dnsmasq.leases
+hostapd.log
+dnsmasq.log
+*.pid
+
+# Editor and OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp

@@ -30,6 +30,9 @@ import (
 //go:embed web.html
 var webFS embed.FS
 
+// infoEnabled is immutable after flag parsing and controls diagnostic command tracing.
+var infoEnabled bool
+
 type Config struct {
 	// Service settings are deliberately not part of the web/config-file model.
 	// They are supplied at process start and remain in server memory only.
@@ -114,16 +117,22 @@ type app struct {
 
 func main() {
 	var listen, workdir, configPath, username, password string
+	var startupDelay int
 	flag.StringVar(&listen, "listen", "0.0.0.0:8080", "web listen address")
 	flag.StringVar(&workdir, "workdir", "", "runtime directory")
 	flag.StringVar(&username, "username", "", "console basic-auth username")
 	flag.StringVar(&password, "password", "", "console basic-auth password")
 	flag.StringVar(&configPath, "config", "", "JSON configuration to start")
+	flag.IntVar(&startupDelay, "delay", 0, "seconds to delay startup from --config")
+	flag.BoolVar(&infoEnabled, "info", false, "print executed system commands and their purpose")
 	flag.Parse()
+	if startupDelay < 0 {
+		log.Fatal("--delay must be zero or a positive number of seconds")
+	}
 	if configPath != "" {
 		flag.Visit(func(f *flag.Flag) {
 			switch f.Name {
-			case "config", "listen", "workdir", "username", "password":
+			case "config", "listen", "workdir", "username", "password", "delay", "info":
 				// These process-level settings are intentionally not stored in JSON.
 			default:
 				log.Fatalf("--config cannot be combined with --%s", f.Name)
@@ -167,13 +176,21 @@ func main() {
 		LeaseTime:       "12h",
 	}}
 	a.checks, a.fw = environment()
+	var delayedConfig *Config
 	if configPath != "" {
 		cfg, err := readConfig(configPath)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if err = a.start(cfg); err != nil {
-			log.Fatal(err)
+		// Keep the web form aligned with a configuration that is waiting for a
+		// delayed start, rather than showing the built-in defaults meanwhile.
+		a.baseConfig = cfg
+		if startupDelay == 0 {
+			if err = a.start(cfg); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			delayedConfig = &cfg
 		}
 	}
 	mux := http.NewServeMux()
@@ -190,9 +207,34 @@ func main() {
 			log.Printf("web server: %v", err)
 		}
 	}()
+	var cancelDelayedStart chan struct{}
+	var delayedStartDone chan struct{}
+	if delayedConfig != nil {
+		cancelDelayedStart = make(chan struct{})
+		delayedStartDone = make(chan struct{})
+		log.Printf("configuration loaded; hotspot startup will begin in %d seconds", startupDelay)
+		go func(cfg Config, delay int) {
+			defer close(delayedStartDone)
+			timer := time.NewTimer(time.Duration(delay) * time.Second)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+				log.Printf("delayed hotspot startup begins")
+				if err := a.start(cfg); err != nil {
+					log.Printf("delayed hotspot startup failed: %v", err)
+				}
+			case <-cancelDelayedStart:
+				log.Printf("delayed hotspot startup cancelled")
+			}
+		}(*delayedConfig, startupDelay)
+	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
+	if cancelDelayedStart != nil {
+		close(cancelDelayedStart)
+		<-delayedStartDone
+	}
 	a.stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -511,6 +553,7 @@ func (a *app) start(c Config) error {
 	a.hostapd = exec.Command("hostapd", filepath.Join(a.workdir, "hostapd.conf"))
 	a.hostapd.Stdout = hostLog
 	a.hostapd.Stderr = hostLog
+	logCommand(a.hostapd.Path, a.hostapd.Args[1:]...)
 	if err := a.hostapd.Start(); err != nil {
 		_ = hostLog.Close()
 		return rollback(fmt.Errorf("hostapd: %w", err))
@@ -533,6 +576,7 @@ func (a *app) start(c Config) error {
 	a.dnsmasq = exec.Command("dnsmasq", "--keep-in-foreground", "--conf-file="+filepath.Join(a.workdir, "dnsmasq.conf"))
 	a.dnsmasq.Stdout = dnsLog
 	a.dnsmasq.Stderr = dnsLog
+	logCommand(a.dnsmasq.Path, a.dnsmasq.Args[1:]...)
 	if err := a.dnsmasq.Start(); err != nil {
 		_ = dnsLog.Close()
 		return rollback(fmt.Errorf("dnsmasq: %w", err))
@@ -555,9 +599,11 @@ func (a *app) stop() { a.mu.Lock(); defer a.mu.Unlock(); a.cleanupLocked() }
 func (a *app) cleanupLocked() {
 	a.stopping = true
 	if a.dnsmasq != nil && a.dnsmasq.Process != nil {
+		logInfof("动作: 停止 DHCP 服务；发送 SIGTERM 给 dnsmasq (PID %d)", a.dnsmasq.Process.Pid)
 		_ = a.dnsmasq.Process.Signal(syscall.SIGTERM)
 	}
 	if a.hostapd != nil && a.hostapd.Process != nil {
+		logInfof("动作: 停止 Wi-Fi 热点；发送 SIGTERM 给 hostapd (PID %d)", a.hostapd.Process.Pid)
 		_ = a.hostapd.Process.Signal(syscall.SIGTERM)
 	}
 	a.dnsmasq = nil
@@ -657,7 +703,7 @@ func (a *app) unmanageNM(iface string) error {
 	if _, e := exec.LookPath("nmcli"); e != nil {
 		return nil
 	}
-	out, e := exec.Command("nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", iface).Output()
+	out, e := commandOutput("nmcli", "-t", "-f", "GENERAL.STATE", "device", "show", iface)
 	if e != nil {
 		return nil
 	}
@@ -735,7 +781,7 @@ func (a *app) clients() ClientStatus {
 		return ClientStatus{}
 	}
 	now := time.Now()
-	out, e := exec.Command("hostapd_cli", "-p", a.workdir, "-i", a.cfg.Interface, "all_sta").CombinedOutput()
+	out, e := commandCombinedOutput("hostapd_cli", "-p", a.workdir, "-i", a.cfg.Interface, "all_sta")
 	if e != nil {
 		return ClientStatus{Error: strings.TrimSpace(string(out))}
 	}
@@ -852,13 +898,15 @@ func bytesPerSecond(current, previous uint64, then, now time.Time, valid bool) f
 	return float64(current-previous) / seconds
 }
 func run(name string, args ...string) error {
-	o, e := exec.Command(name, args...).CombinedOutput()
+	o, e := commandCombinedOutput(name, args...)
 	if e != nil {
 		return fmt.Errorf("%s: %w: %s", name, e, strings.TrimSpace(string(o)))
 	}
 	return nil
 }
 func runInput(s, name string, args ...string) error {
+	logCommand(name, args...)
+	logInfof("command stdin for %s:\n%s", name, s)
 	c := exec.Command(name, args...)
 	c.Stdin = strings.NewReader(s)
 	o, e := c.CombinedOutput()
@@ -867,9 +915,85 @@ func runInput(s, name string, args ...string) error {
 	}
 	return nil
 }
+func logInfof(format string, args ...any) {
+	if infoEnabled {
+		log.Printf(format, args...)
+	}
+}
+func logCommand(name string, args ...string) {
+	if !infoEnabled {
+		return
+	}
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, name)
+	for _, arg := range args {
+		parts = append(parts, strconv.Quote(arg))
+	}
+	log.Printf("动作: %s", commandAction(name, args))
+	log.Printf("命令: %s", strings.Join(parts, " "))
+}
+
+func commandAction(name string, args []string) string {
+	joined := strings.Join(args, " ")
+	switch name {
+	case "hostapd":
+		return "启动 Wi-Fi 热点"
+	case "dnsmasq":
+		return "启动 DHCP 服务"
+	case "hostapd_cli":
+		return "查询已连接 Wi-Fi 设备及流量计数"
+	case "nmcli":
+		if strings.Contains(joined, "managed no") {
+			return "让 NetworkManager 停止管理热点网卡"
+		}
+		if strings.Contains(joined, "managed yes") {
+			return "恢复 NetworkManager 对热点网卡的管理"
+		}
+		return "查询 NetworkManager 的网卡状态"
+	case "nft":
+		if strings.Contains(joined, "delete table") {
+			return "删除热点防火墙、转发与 NAT 规则"
+		}
+		return "应用热点防火墙、转发与 NAT 规则"
+	case "iptables":
+		if strings.Contains(joined, " -D ") || (len(args) > 0 && args[0] == "-D") {
+			return "删除热点防火墙或 NAT 规则"
+		}
+		return "添加热点防火墙、转发或 NAT 规则"
+	case "ip":
+		if strings.HasPrefix(joined, "link set") {
+			return "修改热点无线网卡的链路状态"
+		}
+		if strings.HasPrefix(joined, "addr flush") {
+			return "清除热点网卡现有 IP 地址"
+		}
+		if strings.HasPrefix(joined, "addr add") {
+			return "为热点网卡配置网关 IP 地址"
+		}
+		if strings.HasPrefix(joined, "route show default") {
+			return "检测默认上游网络接口"
+		}
+		return "查询或配置网络接口与路由"
+	case "iw":
+		if strings.Contains(joined, "phy") {
+			return "检查无线网卡是否支持 AP 模式"
+		}
+		return "检测无线网络接口"
+	default:
+		return "执行外部系统命令"
+	}
+}
+func commandOutput(name string, args ...string) ([]byte, error) {
+	logCommand(name, args...)
+	return exec.Command(name, args...).Output()
+}
+func commandCombinedOutput(name string, args ...string) ([]byte, error) {
+	logCommand(name, args...)
+	return exec.Command(name, args...).CombinedOutput()
+}
 func readTrim(p string) string { b, _ := os.ReadFile(p); return strings.TrimSpace(string(b)) }
 func wirelessInterfaces() []string {
-	o, e := exec.Command("iw", "dev").Output()
+	o, e := commandOutput("iw", "dev")
 	if e != nil {
 		return []string{}
 	}
@@ -884,7 +1008,7 @@ func wirelessInterfaces() []string {
 	return r
 }
 func wirelessAPCapable(iface string) bool {
-	out, err := exec.Command("iw", "dev", iface, "info").Output()
+	out, err := commandOutput("iw", "dev", iface, "info")
 	if err != nil {
 		return false
 	}
@@ -899,7 +1023,7 @@ func wirelessAPCapable(iface string) bool {
 	if phy == "" {
 		return false
 	}
-	out, err = exec.Command("iw", "phy", phy, "info").Output()
+	out, err = commandOutput("iw", "phy", phy, "info")
 	if err != nil {
 		return false
 	}
@@ -914,7 +1038,7 @@ func contains(a []string, s string) bool {
 	return false
 }
 func defaultInterface() (string, error) {
-	o, e := exec.Command("ip", "route", "show", "default").Output()
+	o, e := commandOutput("ip", "route", "show", "default")
 	if e != nil {
 		return "", e
 	}

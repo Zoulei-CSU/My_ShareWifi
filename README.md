@@ -63,6 +63,16 @@ sudo ./sharewifi --workdir /var/lib/sharewifi
 
 启动后访问 `http://主机地址:8080`。默认页面已提供一组可编辑的热点与 DHCP 参数。
 
+### 命令执行日志
+
+默认只输出服务启动、停止和错误日志。需要排查热点创建、DHCP、NetworkManager 或防火墙规则时，使用 `-info` 输出每个外部命令的用途、完整参数，以及 `nft` 规则文本：
+
+```sh
+sudo ./sharewifi -info
+```
+
+该开关不会改变热点行为，仅增加控制台诊断输出。
+
 ### 控制台认证
 
 可选的 HTTP Basic Auth 认证需要用户名和密码同时提供：
@@ -84,10 +94,13 @@ sudo ./sharewifi --config /etc/sharewifi/home.json \
   --workdir /var/lib/sharewifi \
   --username admin --password 'replace-this-password'
 
+# Web 控制台立即启动，30 秒后按 JSON 创建热点
+sudo ./sharewifi --config /etc/sharewifi/home.json --delay 30
+
 sudo ./sharewifi -listen 0.0.0.0:8081 -username zoulei -password admin123 -workdir /home/zouleid/tmp -config /home/zouleid/tmp/sharewifi.json
 ```
 
-`--config` 仅读取热点和 DHCP 参数；`--listen`、`--workdir`、`--username`、`--password` 是进程级参数，不会写入 JSON，可以与 `--config` 同时使用。
+`--config` 仅读取热点和 DHCP 参数；`--listen`、`--workdir`、`--username`、`--password`、`-info`、`--delay` 是进程级参数，不会写入 JSON，可以与 `--config` 同时使用。`--delay` 的单位是秒，默认 `0`，仅在同时指定 `--config` 时生效；延迟期间 Web 控制台可正常访问，正常退出程序会取消尚未开始的热点创建。
 
 配置示例：
 

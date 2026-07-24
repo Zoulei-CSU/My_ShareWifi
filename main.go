@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 //go:embed web.html
@@ -32,7 +34,7 @@ var webFS embed.FS
 
 // Version is intentionally embedded in every binary so deployed instances can
 // be identified without starting the web service.
-const Version = "v0.1.7"
+const Version = "v0.1.12"
 
 // infoEnabled is immutable after flag parsing and controls diagnostic command tracing.
 var infoEnabled bool
@@ -107,6 +109,17 @@ type WirelessCapabilities struct {
 	Error         string `json:"error,omitempty"`
 	auto24GHz     []int
 	auto5GHz      []int
+}
+type ChannelScanStatus struct {
+	Interface string           `json:"interface"`
+	Networks  []ScannedNetwork `json:"networks"`
+}
+type ScannedNetwork struct {
+	BSSID     string  `json:"bssid"`
+	SSID      string  `json:"ssid"`
+	Frequency int     `json:"frequency"`
+	Channel   int     `json:"channel"`
+	SignalDBM float64 `json:"signal_dbm"`
 }
 type trafficSample struct {
 	rx, tx uint64
@@ -310,9 +323,37 @@ func (a *app) routes(m *http.ServeMux) {
 		jsonOut(w, wirelessCapabilities(iface))
 	})
 	m.HandleFunc("/api/clients", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, a.clients()) })
+	m.HandleFunc("/api/channel-scan", a.channelScanAPI)
 	m.HandleFunc("/api/config", a.configAPI)
 	m.HandleFunc("/api/start", a.startAPI)
 	m.HandleFunc("/api/stop", a.stopAPI)
+}
+func (a *app) channelScanAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonErr(w, http.StatusMethodNotAllowed, errors.New("GET required"))
+		return
+	}
+	iface := r.URL.Query().Get("interface")
+	if iface == "" {
+		jsonErr(w, http.StatusBadRequest, errors.New("请选择需要扫描的无线网卡"))
+		return
+	}
+	if !contains(wirelessInterfaces(), iface) {
+		jsonErr(w, http.StatusBadRequest, fmt.Errorf("%s 不是当前可用的无线网卡", iface))
+		return
+	}
+	out, err := commandCombinedOutput("iw", "dev", iface, "scan")
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail != "" {
+			err = fmt.Errorf("扫描无线网络失败：%v：%s", err, detail)
+		} else {
+			err = fmt.Errorf("扫描无线网络失败：%w", err)
+		}
+		jsonErr(w, http.StatusBadRequest, err)
+		return
+	}
+	jsonOut(w, ChannelScanStatus{Interface: iface, Networks: parseChannelScan(string(out))})
 }
 func statusMessage(r bool, lastError string) string {
 	if r {
@@ -1062,6 +1103,9 @@ func commandAction(name string, args []string) string {
 		}
 		return "查询或配置网络接口与路由"
 	case "iw":
+		if strings.Contains(joined, " scan") {
+			return "扫描附近 Wi-Fi 网络的信道占用情况"
+		}
 		if strings.Contains(joined, "phy") {
 			return "检查无线网卡是否支持 AP 模式"
 		}
@@ -1165,9 +1209,9 @@ func parseWirelessCapabilities(output string) WirelessCapabilities {
 func parseFrequencyChannel(fields []string) (int, int, bool) {
 	frequency := 0
 	for i := 0; i+1 < len(fields); i++ {
-		value, err := strconv.ParseFloat(strings.Trim(fields[i], "*[](),"), 64)
+		value, err := parseFrequencyMHz(strings.Trim(fields[i], "*[](),"))
 		if err == nil && strings.EqualFold(strings.Trim(fields[i+1], "():,"), "MHz") {
-			frequency = int(value)
+			frequency = value
 			break
 		}
 	}
@@ -1185,6 +1229,16 @@ func parseFrequencyChannel(fields []string) (int, int, bool) {
 		channel = frequencyChannel(frequency)
 	}
 	return frequency, channel, channel > 0
+}
+func parseFrequencyMHz(value string) (int, error) {
+	mhz, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+	if err != nil || mhz <= 0 {
+		if err != nil {
+			return 0, err
+		}
+		return 0, errors.New("frequency must be positive")
+	}
+	return int(math.Round(mhz)), nil
 }
 func appendUniqueInt(values []int, value int) []int {
 	for _, existing := range values {
@@ -1276,7 +1330,7 @@ func automaticChannel(iface, band string, candidates []int) int {
 			if len(fields) != 2 || fields[0] != "freq:" {
 				continue
 			}
-			freq, parseErr := strconv.Atoi(fields[1])
+			freq, parseErr := parseFrequencyMHz(fields[1])
 			if parseErr != nil {
 				continue
 			}
@@ -1295,6 +1349,80 @@ func automaticChannel(iface, band string, candidates []int) int {
 		}
 	}
 	return best
+}
+
+func parseChannelScan(output string) []ScannedNetwork {
+	var networks []ScannedNetwork
+	var current *ScannedNetwork
+	appendCurrent := func() {
+		if current != nil && current.Channel != 0 {
+			networks = append(networks, *current)
+		}
+	}
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "BSS ") {
+			appendCurrent()
+			current = &ScannedNetwork{}
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				current.BSSID = strings.SplitN(fields[1], "(", 2)[0]
+			}
+			continue
+		}
+		if current == nil {
+			continue
+		}
+		if strings.HasPrefix(line, "freq:") {
+			freq, err := parseFrequencyMHz(strings.TrimSpace(strings.TrimPrefix(line, "freq:")))
+			if err == nil {
+				current.Frequency = freq
+				current.Channel = frequencyChannel(freq)
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "signal:") {
+			fields := strings.Fields(strings.TrimSpace(strings.TrimPrefix(line, "signal:")))
+			if len(fields) > 0 {
+				current.SignalDBM, _ = strconv.ParseFloat(fields[0], 64)
+			}
+			continue
+		}
+		if strings.HasPrefix(line, "SSID:") {
+			current.SSID = decodeSSID(strings.TrimSpace(strings.TrimPrefix(line, "SSID:")))
+		}
+	}
+	appendCurrent()
+	sort.Slice(networks, func(i, j int) bool {
+		if networks[i].Frequency != networks[j].Frequency {
+			return networks[i].Frequency < networks[j].Frequency
+		}
+		return networks[i].SignalDBM > networks[j].SignalDBM
+	})
+	return networks
+}
+
+func decodeSSID(value string) string {
+	if !strings.Contains(value, `\x`) {
+		return value
+	}
+	decoded := make([]byte, 0, len(value))
+	for i := 0; i < len(value); {
+		if i+3 < len(value) && value[i] == '\\' && value[i+1] == 'x' {
+			byteValue, err := strconv.ParseUint(value[i+2:i+4], 16, 8)
+			if err == nil {
+				decoded = append(decoded, byte(byteValue))
+				i += 4
+				continue
+			}
+		}
+		decoded = append(decoded, value[i])
+		i++
+	}
+	if utf8.Valid(decoded) {
+		return string(decoded)
+	}
+	return value
 }
 func frequencyChannel(freq int) int {
 	if freq == 2484 {

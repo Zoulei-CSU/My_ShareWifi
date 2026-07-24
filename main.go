@@ -1,4 +1,4 @@
-// sharewifi provides a small web console for a Linux hostapd/dnsmasq hotspot.
+// sharewifi provides a small web console for a Linux hostapd hotspot.
 package main
 
 import (
@@ -29,6 +29,10 @@ import (
 
 //go:embed web.html
 var webFS embed.FS
+
+// Version is intentionally embedded in every binary so deployed instances can
+// be identified without starting the web service.
+const Version = "v0.1.7"
 
 // infoEnabled is immutable after flag parsing and controls diagnostic command tracing.
 var infoEnabled bool
@@ -71,9 +75,10 @@ type Status struct {
 	Logs     string  `json:"logs,omitempty"`
 }
 type ClientStatus struct {
-	Clients   []ClientTraffic  `json:"clients"`
-	Interface InterfaceTraffic `json:"interface"`
-	Error     string           `json:"error,omitempty"`
+	Clients     []ClientTraffic  `json:"clients"`
+	Interface   InterfaceTraffic `json:"interface"`
+	DHCPBackend string           `json:"dhcp_backend,omitempty"`
+	Error       string           `json:"error,omitempty"`
 }
 type ClientTraffic struct {
 	MAC     string  `json:"mac"`
@@ -93,31 +98,47 @@ type InterfaceTraffic struct {
 	RXBPS   float64 `json:"rx_bps"`
 	TXBPS   float64 `json:"tx_bps"`
 }
+type WirelessCapabilities struct {
+	Channels24GHz []int  `json:"channels_24ghz"`
+	Channels5GHz  []int  `json:"channels_5ghz"`
+	Supports5GHz  bool   `json:"supports_5ghz"`
+	AutoChannel   bool   `json:"auto_channel"`
+	Source        string `json:"source,omitempty"`
+	Error         string `json:"error,omitempty"`
+	auto24GHz     []int
+	auto5GHz      []int
+}
 type trafficSample struct {
 	rx, tx uint64
 	at     time.Time
 }
 type app struct {
-	mu               sync.Mutex
-	workdir          string
-	checks           []Check
-	fw               string
-	running          bool
-	cfg              *Config
-	hostapd, dnsmasq *exec.Cmd
-	nmManaged        bool
-	nmInterface      string
-	oldForward       string
-	lastError        string
-	stopping         bool
-	baseConfig       Config
-	clientSamples    map[string]trafficSample
-	interfaceSample  trafficSample
+	mu              sync.Mutex
+	workdir         string
+	checks          []Check
+	fw              string
+	running         bool
+	cfg             *Config
+	hostapd, dhcp   *exec.Cmd
+	dhcpBackend     string
+	nmManaged       bool
+	nmInterface     string
+	oldForward      string
+	lastError       string
+	stopping        bool
+	baseConfig      Config
+	clientSamples   map[string]trafficSample
+	interfaceSample trafficSample
 }
 
 func main() {
 	var listen, workdir, configPath, username, password string
 	var startupDelay int
+	var showVersion bool
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "ShareWiFi %s\n\nUsage: sharewifi [options]\n\nOptions:\n", Version)
+		flag.PrintDefaults()
+	}
 	flag.StringVar(&listen, "listen", "0.0.0.0:8080", "web listen address")
 	flag.StringVar(&workdir, "workdir", "", "runtime directory")
 	flag.StringVar(&username, "username", "", "console basic-auth username")
@@ -125,7 +146,12 @@ func main() {
 	flag.StringVar(&configPath, "config", "", "JSON configuration to start")
 	flag.IntVar(&startupDelay, "delay", 0, "seconds to delay startup from --config")
 	flag.BoolVar(&infoEnabled, "info", false, "print executed system commands and their purpose")
+	flag.BoolVar(&showVersion, "version", false, "print version and exit")
 	flag.Parse()
+	if showVersion {
+		fmt.Println(Version)
+		return
+	}
 	if startupDelay < 0 {
 		log.Fatal("--delay must be zero or a positive number of seconds")
 	}
@@ -175,7 +201,7 @@ func main() {
 		DHCPEnd:         "192.168.50.200",
 		LeaseTime:       "12h",
 	}}
-	a.checks, a.fw = environment()
+	a.checks, a.fw, a.dhcpBackend = environment()
 	var delayedConfig *Config
 	if configPath != "" {
 		cfg, err := readConfig(configPath)
@@ -275,6 +301,14 @@ func (a *app) routes(m *http.ServeMux) {
 		jsonOut(w, Status{Running: a.running, Message: statusMessage(a.running, a.lastError), Config: a.exportConfig(), Workdir: a.workdir, Checks: a.checks, Firewall: a.fw, Logs: a.logs()})
 	})
 	m.HandleFunc("/api/interfaces", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, wirelessInterfaces()) })
+	m.HandleFunc("/api/capabilities", func(w http.ResponseWriter, r *http.Request) {
+		iface := r.URL.Query().Get("interface")
+		if iface == "" {
+			jsonErr(w, http.StatusBadRequest, errors.New("interface is required"))
+			return
+		}
+		jsonOut(w, wirelessCapabilities(iface))
+	})
 	m.HandleFunc("/api/clients", func(w http.ResponseWriter, r *http.Request) { jsonOut(w, a.clients()) })
 	m.HandleFunc("/api/config", a.configAPI)
 	m.HandleFunc("/api/start", a.startAPI)
@@ -337,16 +371,29 @@ func (a *app) stopAPI(w http.ResponseWriter, r *http.Request) {
 	jsonOut(w, map[string]string{"message": "stopped"})
 }
 
-func environment() ([]Check, string) {
+func environment() ([]Check, string, string) {
 	cmds := []struct {
 		name     string
 		required bool
-	}{{"hostapd", true}, {"dnsmasq", true}, {"ip", true}, {"iw", true}, {"hostapd_cli", false}}
-	checks := make([]Check, 0, len(cmds)+1)
+	}{{"hostapd", true}, {"ip", true}, {"iw", true}, {"hostapd_cli", false}}
+	checks := make([]Check, 0, len(cmds)+2)
 	for _, c := range cmds {
 		_, e := exec.LookPath(c.name)
 		checks = append(checks, Check{c.name, e == nil, c.required, installHelp(c.name)})
 	}
+	_, dnsmasq := exec.LookPath("dnsmasq")
+	_, udhcpd := exec.LookPath("udhcpd")
+	dhcp := ""
+	if dnsmasq == nil {
+		dhcp = "dnsmasq"
+	} else if udhcpd == nil {
+		dhcp = "udhcpd"
+	}
+	dhcpHelp := "Debian/Ubuntu：sudo apt install dnsmasq 或 sudo apt install udhcpd；Fedora/CentOS：sudo dnf install dnsmasq 或 sudo dnf install udhcpd"
+	if dhcp != "" {
+		dhcpHelp = "当前使用 " + dhcp
+	}
+	checks = append(checks, Check{"dnsmasq 或 udhcpd", dhcp != "", true, dhcpHelp})
 	_, nft := exec.LookPath("nft")
 	_, ipt := exec.LookPath("iptables")
 	fw := ""
@@ -355,8 +402,16 @@ func environment() ([]Check, string) {
 	} else if ipt == nil {
 		fw = "iptables"
 	}
-	checks = append(checks, Check{"nft or iptables", fw != "", true, "Debian/Ubuntu: sudo apt install nftables; Fedora/CentOS: sudo dnf install nftables"})
-	return checks, fw
+	fwHelp := "Debian/Ubuntu：sudo apt install nftables 或 sudo apt install iptables；Fedora/CentOS：sudo dnf install nftables 或 sudo dnf install iptables"
+	if fw != "" {
+		if fw == "nftables" {
+			fwHelp = "当前使用 nft（nftables）"
+		} else {
+			fwHelp = "当前使用 iptables"
+		}
+	}
+	checks = append(checks, Check{"nft 或 iptables", fw != "", true, fwHelp})
+	return checks, fw, dhcp
 }
 func installHelp(name string) string {
 	pkg := name
@@ -427,8 +482,8 @@ func validate(c Config) error {
 	if c.Band != "2.4GHz" && c.Band != "5GHz" {
 		return errors.New("band must be 2.4GHz or 5GHz")
 	}
-	if c.Channel < 1 || c.Channel > 196 {
-		return errors.New("invalid channel")
+	if c.Channel < 0 || c.Channel > 196 {
+		return errors.New("invalid channel; use 0 for automatic selection")
 	}
 	ip, n, e := net.ParseCIDR(c.GatewayCIDR)
 	ones, bits := 0, 0
@@ -495,10 +550,10 @@ func (a *app) start(c Config) error {
 	a.lastError = ""
 	a.clientSamples = make(map[string]trafficSample)
 	a.interfaceSample = trafficSample{}
-	if err := a.prepareLogs(); err != nil {
+	if err := missingChecks(a.checks); err != nil {
 		return err
 	}
-	if err := missingChecks(a.checks); err != nil {
+	if err := a.prepareLogs(); err != nil {
 		return err
 	}
 	if !contains(wirelessInterfaces(), c.Interface) {
@@ -518,6 +573,11 @@ func (a *app) start(c Config) error {
 	}
 	if upstream == c.Interface {
 		return errors.New("upstream interface cannot be the AP interface")
+	}
+	var channelErr error
+	c.Channel, channelErr = resolveChannel(c.Interface, c.Band, c.Channel)
+	if channelErr != nil {
+		return channelErr
 	}
 	if err := a.unmanageNM(c.Interface); err != nil {
 		return err
@@ -569,27 +629,31 @@ func (a *app) start(c Config) error {
 	if err := a.processSurvives(hostapdCmd, "hostapd"); err != nil {
 		return rollback(err)
 	}
-	dnsLog, err := os.OpenFile(filepath.Join(a.workdir, "dnsmasq.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
+	dhcpLog, err := os.OpenFile(a.dhcpLogPath(), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
 		return rollback(err)
 	}
-	a.dnsmasq = exec.Command("dnsmasq", "--keep-in-foreground", "--conf-file="+filepath.Join(a.workdir, "dnsmasq.conf"))
-	a.dnsmasq.Stdout = dnsLog
-	a.dnsmasq.Stderr = dnsLog
-	logCommand(a.dnsmasq.Path, a.dnsmasq.Args[1:]...)
-	if err := a.dnsmasq.Start(); err != nil {
-		_ = dnsLog.Close()
-		return rollback(fmt.Errorf("dnsmasq: %w", err))
+	if a.dhcpBackend == "dnsmasq" {
+		a.dhcp = exec.Command("dnsmasq", "--keep-in-foreground", "--conf-file="+a.dhcpConfigPath())
+	} else {
+		a.dhcp = exec.Command("udhcpd", "-f", a.dhcpConfigPath())
 	}
-	dnsmasqCmd := a.dnsmasq
-	go func(cmd *exec.Cmd) {
+	a.dhcp.Stdout = dhcpLog
+	a.dhcp.Stderr = dhcpLog
+	logCommand(a.dhcp.Path, a.dhcp.Args[1:]...)
+	if err := a.dhcp.Start(); err != nil {
+		_ = dhcpLog.Close()
+		return rollback(fmt.Errorf("%s: %w", a.dhcpBackend, err))
+	}
+	dhcpCmd := a.dhcp
+	go func(cmd *exec.Cmd, backend string) {
 		err := cmd.Wait()
-		_ = dnsLog.Close()
+		_ = dhcpLog.Close()
 		if err != nil {
-			a.recordFailure("dnsmasq", err)
+			a.recordFailure(backend, err)
 		}
-	}(dnsmasqCmd)
-	if err := a.processSurvives(dnsmasqCmd, "dnsmasq"); err != nil {
+	}(dhcpCmd, a.dhcpBackend)
+	if err := a.processSurvives(dhcpCmd, a.dhcpBackend); err != nil {
 		return rollback(err)
 	}
 	a.running = true
@@ -598,15 +662,15 @@ func (a *app) start(c Config) error {
 func (a *app) stop() { a.mu.Lock(); defer a.mu.Unlock(); a.cleanupLocked() }
 func (a *app) cleanupLocked() {
 	a.stopping = true
-	if a.dnsmasq != nil && a.dnsmasq.Process != nil {
-		logInfof("动作: 停止 DHCP 服务；发送 SIGTERM 给 dnsmasq (PID %d)", a.dnsmasq.Process.Pid)
-		_ = a.dnsmasq.Process.Signal(syscall.SIGTERM)
+	if a.dhcp != nil && a.dhcp.Process != nil {
+		logInfof("动作: 停止 DHCP 服务；发送 SIGTERM 给 %s (PID %d)", a.dhcpBackend, a.dhcp.Process.Pid)
+		_ = a.dhcp.Process.Signal(syscall.SIGTERM)
 	}
 	if a.hostapd != nil && a.hostapd.Process != nil {
 		logInfof("动作: 停止 Wi-Fi 热点；发送 SIGTERM 给 hostapd (PID %d)", a.hostapd.Process.Pid)
 		_ = a.hostapd.Process.Signal(syscall.SIGTERM)
 	}
-	a.dnsmasq = nil
+	a.dhcp = nil
 	a.hostapd = nil
 	if a.cfg != nil {
 		a.removeFirewall(*a.cfg)
@@ -622,7 +686,7 @@ func (a *app) cleanupLocked() {
 	a.stopping = false
 }
 func (a *app) prepareLogs() error {
-	for _, name := range []string{"hostapd.log", "dnsmasq.log"} {
+	for _, name := range []string{"hostapd.log", filepath.Base(a.dhcpLogPath())} {
 		if err := os.WriteFile(filepath.Join(a.workdir, name), nil, 0600); err != nil {
 			return err
 		}
@@ -647,7 +711,7 @@ func (a *app) recordFailure(name string, err error) {
 }
 func (a *app) logs() string {
 	var parts []string
-	for _, name := range []string{"hostapd.log", "dnsmasq.log"} {
+	for _, name := range []string{"hostapd.log", filepath.Base(a.dhcpLogPath())} {
 		if b, err := os.ReadFile(filepath.Join(a.workdir, name)); err == nil && len(b) > 0 {
 			if len(b) > 8192 {
 				b = b[len(b)-8192:]
@@ -668,15 +732,29 @@ func (a *app) exportConfig() *Config {
 }
 func (a *app) writeConfigs(c Config) error {
 	h := fmt.Sprintf("interface=%s\ndriver=nl80211\nctrl_interface=%s\nctrl_interface_group=0\nssid=%s\nhw_mode=%s\nchannel=%d\ncountry_code=%s\nieee80211d=1\nwmm_enabled=1\nauth_algs=1\nwpa=2\nwpa_passphrase=%s\nwpa_key_mgmt=WPA-PSK\nrsn_pairwise=CCMP\n", c.Interface, a.workdir, c.SSID, map[bool]string{true: "g", false: "a"}[c.Band == "2.4GHz"], c.Channel, c.CountryCode, c.Passphrase)
-	// The host may already run systemd-resolved, NetworkManager dnsmasq, or
-	// another DNS daemon on port 53.  This instance is only the DHCP authority;
-	// disable its DNS listener and pass upstream resolvers to clients instead.
-	d := fmt.Sprintf("interface=%s\nbind-interfaces\nport=0\ndhcp-leasefile=%s\ndhcp-range=%s,%s,%s\ndhcp-option=3,%s\ndhcp-option=6,%s\n", c.Interface, filepath.Join(a.workdir, "dnsmasq.leases"), c.DHCPStart, c.DHCPEnd, c.LeaseTime, hostIP(c.GatewayCIDR), strings.Join(upstreamDNS(), ","))
 	if err := os.WriteFile(filepath.Join(a.workdir, "hostapd.conf"), []byte(h), 0600); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(a.workdir, "dnsmasq.conf"), []byte(d), 0600)
+	if a.dhcpBackend == "dnsmasq" {
+		// The host may already run systemd-resolved, NetworkManager dnsmasq, or
+		// another DNS daemon on port 53. This instance is DHCP-only, so disable
+		// its DNS listener and pass upstream resolvers to clients instead.
+		d := fmt.Sprintf("interface=%s\nbind-interfaces\nport=0\ndhcp-leasefile=%s\ndhcp-range=%s,%s,%s\ndhcp-option=3,%s\ndhcp-option=6,%s\n", c.Interface, a.dhcpLeasePath(), c.DHCPStart, c.DHCPEnd, c.LeaseTime, hostIP(c.GatewayCIDR), strings.Join(upstreamDNS(), ","))
+		return os.WriteFile(a.dhcpConfigPath(), []byte(d), 0600)
+	}
+	lease, _ := time.ParseDuration(c.LeaseTime)
+	leaseSeconds := int(lease.Seconds())
+	if leaseSeconds < 1 {
+		leaseSeconds = 1
+	}
+	// udhcpd is a DHCP-only daemon. Its lease file has a binary format, so it
+	// cannot supply the IP/host-name correlation used by the dnsmasq backend.
+	d := fmt.Sprintf("start %s\nend %s\ninterface %s\noption subnet %s\noption router %s\noption dns %s\noption lease %d\nlease_file %s\n", c.DHCPStart, c.DHCPEnd, c.Interface, subnetMask(c.GatewayCIDR), hostIP(c.GatewayCIDR), strings.Join(upstreamDNS(), " "), leaseSeconds, a.dhcpLeasePath())
+	return os.WriteFile(a.dhcpConfigPath(), []byte(d), 0600)
 }
+func (a *app) dhcpConfigPath() string { return filepath.Join(a.workdir, a.dhcpBackend+".conf") }
+func (a *app) dhcpLogPath() string    { return filepath.Join(a.workdir, a.dhcpBackend+".log") }
+func (a *app) dhcpLeasePath() string  { return filepath.Join(a.workdir, a.dhcpBackend+".leases") }
 func upstreamDNS() []string {
 	b, err := os.ReadFile("/etc/resolv.conf")
 	if err == nil {
@@ -699,6 +777,10 @@ func upstreamDNS() []string {
 	return []string{"223.5.5.5", "114.114.114.114"}
 }
 func hostIP(c string) string { i, _, _ := net.ParseCIDR(c); return i.String() }
+func subnetMask(c string) string {
+	_, n, _ := net.ParseCIDR(c)
+	return net.IP(n.Mask).String()
+}
 func (a *app) unmanageNM(iface string) error {
 	if _, e := exec.LookPath("nmcli"); e != nil {
 		return nil
@@ -731,7 +813,7 @@ func (a *app) addFirewall(c Config) error {
 		// valid for nft, it makes an error printed by nft directly actionable.
 		allowUpstream := ""
 		if c.AllowUpstreamLAN {
-			allowUpstream = fmt.Sprintf("    iifname %q oifname %q ip saddr %s ip daddr %s accept\\n", c.UpstreamInterface, c.Interface, c.UpstreamLANCIDR, subnet)
+			allowUpstream = fmt.Sprintf("    iifname %q oifname %q ip saddr %s ip daddr %s accept\n", c.UpstreamInterface, c.Interface, c.UpstreamLANCIDR, subnet)
 		}
 		script := fmt.Sprintf(`table ip sharewifi {
   chain forward {
@@ -786,7 +868,10 @@ func (a *app) clients() ClientStatus {
 		return ClientStatus{Error: strings.TrimSpace(string(out))}
 	}
 	clients := parseStationTraffic(string(out))
-	leases := readLeases(filepath.Join(a.workdir, "dnsmasq.leases"))
+	leases := map[string]leaseInfo{}
+	if a.dhcpBackend == "dnsmasq" {
+		leases = readLeases(a.dhcpLeasePath())
+	}
 	for i := range clients {
 		if lease, ok := leases[strings.ToLower(clients[i].MAC)]; ok {
 			clients[i].IP = lease.ip
@@ -804,7 +889,7 @@ func (a *app) clients() ClientStatus {
 	interfaceTraffic.RXBPS = bytesPerSecond(interfaceTraffic.RXBytes, a.interfaceSample.rx, a.interfaceSample.at, now, !a.interfaceSample.at.IsZero())
 	interfaceTraffic.TXBPS = bytesPerSecond(interfaceTraffic.TXBytes, a.interfaceSample.tx, a.interfaceSample.at, now, !a.interfaceSample.at.IsZero())
 	a.interfaceSample = trafficSample{rx: interfaceTraffic.RXBytes, tx: interfaceTraffic.TXBytes, at: now}
-	return ClientStatus{Clients: clients, Interface: interfaceTraffic}
+	return ClientStatus{Clients: clients, Interface: interfaceTraffic, DHCPBackend: a.dhcpBackend}
 }
 
 type leaseInfo struct{ ip, name string }
@@ -940,6 +1025,8 @@ func commandAction(name string, args []string) string {
 		return "启动 Wi-Fi 热点"
 	case "dnsmasq":
 		return "启动 DHCP 服务"
+	case "udhcpd":
+		return "启动 DHCP 服务"
 	case "hostapd_cli":
 		return "查询已连接 Wi-Fi 设备及流量计数"
 	case "nmcli":
@@ -1007,23 +1094,240 @@ func wirelessInterfaces() []string {
 	sort.Strings(r)
 	return r
 }
-func wirelessAPCapable(iface string) bool {
-	out, err := commandOutput("iw", "dev", iface, "info")
-	if err != nil {
-		return false
+func wirelessCapabilities(iface string) WirelessCapabilities {
+	phy, err := wirelessPHY(iface)
+	if err == nil {
+		out, phyErr := commandOutput("iw", "phy", phy, "info")
+		if phyErr == nil {
+			caps := parseWirelessCapabilities(string(out))
+			caps.Source = "iw phy " + phy + " info"
+			if len(caps.Channels24GHz) > 0 || len(caps.Channels5GHz) > 0 {
+				return caps
+			}
+		}
 	}
-	var phy string
-	for _, line := range strings.Split(string(out), "\n") {
-		f := strings.Fields(line)
-		if len(f) == 2 && f[0] == "wiphy" {
-			phy = "phy" + f[1]
+	// Some older iw builds or virtual wireless interfaces cannot answer
+	// `iw phy <name> info`. `iw list` is the portable fallback and also makes
+	// failures visible instead of silently returning an empty channel list.
+	out, listErr := commandOutput("iw", "list")
+	if listErr != nil {
+		if err != nil {
+			return fallbackWirelessCapabilities(fmt.Sprintf("无法读取网卡 %s 的 PHY 信息：%v；iw list 也失败：%v", iface, err, listErr))
+		}
+		return fallbackWirelessCapabilities(fmt.Sprintf("无法读取无线频段信息：%v", listErr))
+	}
+	caps := parseWirelessCapabilities(string(out))
+	caps.Source = "iw list（兼容回退）"
+	if len(caps.Channels24GHz) == 0 && len(caps.Channels5GHz) == 0 {
+		return fallbackWirelessCapabilities("iw 已返回信息，但未能解析出 2.4GHz 或 5GHz 信道")
+	}
+	return caps
+}
+func fallbackWirelessCapabilities(reason string) WirelessCapabilities {
+	return WirelessCapabilities{
+		Channels24GHz: []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14},
+		Channels5GHz:  []int{36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 92, 96, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177, 181},
+		Supports5GHz:  true,
+		AutoChannel:   false,
+		Source:        "内置兼容信道表",
+		Error:         reason + "；已使用内置固定信道列表，请手动选择信道。",
+	}
+}
+func parseWirelessCapabilities(output string) WirelessCapabilities {
+	var caps WirelessCapabilities
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		fields := strings.Fields(line)
+		freq, channel, ok := parseFrequencyChannel(fields)
+		if !ok {
+			continue
+		}
+		if freq >= 2400 && freq < 2500 {
+			caps.Channels24GHz = appendUniqueInt(caps.Channels24GHz, channel)
+			if !strings.Contains(line, "disabled") && !strings.Contains(line, "no IR") {
+				caps.auto24GHz = appendUniqueInt(caps.auto24GHz, channel)
+			}
+		} else if freq >= 5000 && freq < 5925 {
+			caps.Channels5GHz = appendUniqueInt(caps.Channels5GHz, channel)
+			if !strings.Contains(line, "disabled") && !strings.Contains(line, "no IR") {
+				caps.auto5GHz = appendUniqueInt(caps.auto5GHz, channel)
+			}
+		}
+	}
+	sort.Ints(caps.Channels24GHz)
+	sort.Ints(caps.Channels5GHz)
+	sort.Ints(caps.auto24GHz)
+	sort.Ints(caps.auto5GHz)
+	caps.Supports5GHz = len(caps.Channels5GHz) > 0
+	caps.AutoChannel = len(caps.Channels24GHz) > 0 || len(caps.Channels5GHz) > 0
+	return caps
+}
+func parseFrequencyChannel(fields []string) (int, int, bool) {
+	frequency := 0
+	for i := 0; i+1 < len(fields); i++ {
+		value, err := strconv.ParseFloat(strings.Trim(fields[i], "*[](),"), 64)
+		if err == nil && strings.EqualFold(strings.Trim(fields[i+1], "():,"), "MHz") {
+			frequency = int(value)
 			break
 		}
 	}
-	if phy == "" {
+	if frequency == 0 {
+		return 0, 0, false
+	}
+	channel := 0
+	for _, field := range fields {
+		if strings.HasPrefix(field, "[") && strings.HasSuffix(field, "]") {
+			channel, _ = strconv.Atoi(strings.Trim(field, "[]"))
+			break
+		}
+	}
+	if channel == 0 {
+		channel = frequencyChannel(frequency)
+	}
+	return frequency, channel, channel > 0
+}
+func appendUniqueInt(values []int, value int) []int {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+func wirelessPHY(iface string) (string, error) {
+	out, err := commandOutput("iw", "dev", iface, "info")
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 && fields[0] == "wiphy" {
+				return "phy" + fields[1], nil
+			}
+		}
+	}
+	// Fallback for iw versions that do not print wiphy in the per-interface
+	// view. The global `iw dev` format groups interfaces under `phy#<number>`.
+	all, allErr := commandOutput("iw", "dev")
+	if allErr != nil {
+		if err != nil {
+			return "", err
+		}
+		return "", allErr
+	}
+	phy := ""
+	for _, line := range strings.Split(string(all), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 1 && strings.HasPrefix(fields[0], "phy#") {
+			phy = "phy" + strings.TrimPrefix(fields[0], "phy#")
+			continue
+		}
+		if len(fields) == 2 && fields[0] == "Interface" && fields[1] == iface && phy != "" {
+			return phy, nil
+		}
+	}
+	return "", errors.New("wireless PHY not found")
+}
+func resolveChannel(iface, band string, requested int) (int, error) {
+	caps := wirelessCapabilities(iface)
+	candidates := caps.Channels24GHz
+	autoCandidates := caps.auto24GHz
+	if band == "5GHz" {
+		candidates = caps.Channels5GHz
+		autoCandidates = caps.auto5GHz
+		if !caps.Supports5GHz {
+			return 0, errors.New("selected wireless interface does not support 5GHz")
+		}
+	}
+	if requested > 0 {
+		if !containsInt(candidates, requested) {
+			return 0, fmt.Errorf("channel %d is not available on %s", requested, iface)
+		}
+		return requested, nil
+	}
+	if !caps.AutoChannel {
+		return 0, errors.New("automatic channel selection is unavailable because wireless capability detection failed; choose a channel manually")
+	}
+	if len(candidates) == 0 {
+		return 0, fmt.Errorf("no usable %s channel was found on %s", band, iface)
+	}
+	// Prefer channels that the current regulatory state permits initiating
+	// radiation on. If none are currently marked usable, retain all hardware
+	// channels: hostapd may enable them after applying the configured country.
+	if len(autoCandidates) > 0 {
+		candidates = autoCandidates
+	}
+	selected := automaticChannel(iface, band, candidates)
+	log.Printf("automatic channel selection: interface=%s band=%s channel=%d", iface, band, selected)
+	return selected, nil
+}
+func containsInt(values []int, wanted int) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+func automaticChannel(iface, band string, candidates []int) int {
+	counts := make(map[int]int, len(candidates))
+	out, err := commandCombinedOutput("iw", "dev", iface, "scan")
+	if err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			fields := strings.Fields(strings.TrimSpace(line))
+			if len(fields) != 2 || fields[0] != "freq:" {
+				continue
+			}
+			freq, parseErr := strconv.Atoi(fields[1])
+			if parseErr != nil {
+				continue
+			}
+			channel := frequencyChannel(freq)
+			if containsInt(candidates, channel) {
+				counts[channel]++
+			}
+		}
+	}
+	preferred := preferredChannels(band)
+	best := candidates[0]
+	bestCount := counts[best]
+	for _, channel := range candidates[1:] {
+		if counts[channel] < bestCount || (counts[channel] == bestCount && preferredRank(channel, preferred) < preferredRank(best, preferred)) {
+			best, bestCount = channel, counts[channel]
+		}
+	}
+	return best
+}
+func frequencyChannel(freq int) int {
+	if freq == 2484 {
+		return 14
+	}
+	if freq >= 2412 && freq <= 2472 && (freq-2407)%5 == 0 {
+		return (freq - 2407) / 5
+	}
+	if freq >= 5000 && (freq-5000)%5 == 0 {
+		return (freq - 5000) / 5
+	}
+	return 0
+}
+func preferredChannels(band string) []int {
+	if band == "5GHz" {
+		return []int{36, 40, 44, 48}
+	}
+	return []int{1, 6, 11}
+}
+func preferredRank(channel int, preferred []int) int {
+	for rank, value := range preferred {
+		if value == channel {
+			return rank
+		}
+	}
+	return len(preferred) + channel
+}
+func wirelessAPCapable(iface string) bool {
+	phy, err := wirelessPHY(iface)
+	if err != nil {
 		return false
 	}
-	out, err = commandOutput("iw", "phy", phy, "info")
+	out, err := commandOutput("iw", "phy", phy, "info")
 	if err != nil {
 		return false
 	}

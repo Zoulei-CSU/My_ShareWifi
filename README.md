@@ -1,6 +1,6 @@
 # ShareWiFi
 
-ShareWiFi 是一个 Linux Wi-Fi 热点共享管理程序。它以单一 Go 二进制运行，内嵌中文 Web 控制台，使用 `hostapd` 创建 WPA2 热点、使用 `dnsmasq` 分配 DHCP 地址，并通过 IPv4 NAT 共享主机的上游网络。
+ShareWiFi 是一个 Linux Wi-Fi 热点共享管理程序。它以单一 Go 二进制运行，内嵌中文 Web 控制台，使用 `hostapd` 创建 WPA2 热点，优先使用 `dnsmasq`、不可用时使用 `udhcpd` 分配 DHCP 地址，并通过 IPv4 NAT 共享主机的上游网络。
 
 适用目标为 Debian/Ubuntu、Fedora、CentOS/RHEL 等 Linux 发行版。程序必须以 root 权限运行。
 
@@ -19,13 +19,15 @@ ShareWiFi 是一个 Linux Wi-Fi 热点共享管理程序。它以单一 Go 二�
 - 提供中文 Web 控制台，默认监听 `0.0.0.0:8080`。
 - 自动检查 root 权限、无线网卡、AP 模式支持和系统依赖，并给出 Debian/Ubuntu、Fedora/CentOS 的安装命令。
 - 配置无线网卡、SSID、WPA2 密码、国家代码、频段、信道、热点网关和 DHCP 地址池。
+- 根据所选无线网卡显示支持的频段和信道；不支持 5GHz 的网卡会禁用 5GHz 选项。
+- 信道支持“自动选择空闲信道”（位于信道列表末尾）。启动前扫描附近无线网络并选择占用较少的候选信道。无线能力读取或解析失败时，页面会给出警告、回退到内置的固定 2.4GHz/5GHz 信道表，并要求手动选择信道。
 - 自动探测默认路由上游接口，也可手动指定。
 - 自动优先使用 `nftables`，不存在时使用 `iptables`，配置 IPv4 转发与 NAT。
 - 使用 NetworkManager 的机器上，临时停止其管理热点网卡；正常停止热点时自动恢复。
 - 导入、导出热点 JSON 配置；可由 `-config` 参数直接启动热点。
 - 支持延迟按 JSON 配置启动热点。
 - 支持可选 HTTP Basic Auth 控制台认证。
-- 页面显示 `hostapd`、`dnsmasq` 启动日志和错误日志。
+- 页面显示 `hostapd` 与当前 DHCP 后端的启动日志和错误日志。
 - 按需显示已连接设备的 MAC、IP、DHCP 主机名、信号、协商速率、累计流量和近似实时速率。
 - 按需显示热点总上传、下载网速图表；监控面板收起时不会采集客户端或流量数据。
 - 可选 `-info` 控制台诊断日志，输出执行的系统命令、用途和防火墙规则文本。
@@ -43,7 +45,7 @@ iw list
 | 用途 | 命令 | 是否必需 |
 | --- | --- | --- |
 | 创建热点 | `hostapd` | 是 |
-| DHCP | `dnsmasq` | 是 |
+| DHCP | `dnsmasq` 或 `udhcpd` | 至少一个，优先 `dnsmasq` |
 | 网络地址与路由配置 | `ip` | 是 |
 | 无线网卡与 AP 能力检测 | `iw` | 是 |
 | NAT | `nft` 或 `iptables` | 至少一个 |
@@ -55,8 +57,14 @@ iw list
 sudo apt update
 sudo apt install hostapd dnsmasq iproute2 iw nftables
 
+# 或者使用 udhcpd 替代 dnsmasq
+sudo apt install udhcpd
+
 # Fedora / CentOS / RHEL
 sudo dnf install hostapd dnsmasq iproute iw nftables
+
+# 或者使用 udhcpd 替代 dnsmasq
+sudo dnf install udhcpd
 ```
 
 ## 快速使用
@@ -79,6 +87,7 @@ sudo ./sharewifi
 | `-config FILE` | 读取热点 JSON 配置并启动热点。 |
 | `-delay SECONDS` | 与 `-config` 同时使用时，延迟指定秒数后创建热点；默认 `0`。 |
 | `-info` | 输出执行命令的用途、完整参数和 `nft` 规则，默认关闭。 |
+| `-version` | 输出二进制版本号后退出。 |
 
 Go 标准参数同时接受单横线和双横线，例如 `-config` 与 `--config` 等价。
 
@@ -133,6 +142,8 @@ sudo ./sharewifi \
 ```
 
 `upstream_interface` 为空时使用默认 IPv4 路由的接口。启用 `allow_upstream_lan` 后，只有 `upstream_lan_cidr` 中的上游设备可主动访问热点网段。例如上游为 `172.16.41.0/24`、共享主机上游地址为 `172.16.41.50`、热点网段为 `192.168.50.0/24` 时，在页面填写 `172.16.41.0/24`，并在上游设备中添加路由：
+
+将 JSON 中的 `channel` 设置为 `0`，或在页面选择“自动选择空闲信道”，程序会在启动前执行 `iw dev <无线网卡> scan`，统计候选信道上扫描到的附近 AP 数量，选择数量较少的信道；同等占用时优先 2.4GHz 的 1/6/11 或 5GHz 的 36/40/44/48。扫描完成后，程序会把选出的具体信道数值写入 `hostapd.conf`，而不是把“自动”交给 hostapd。扫描通常需要数秒；扫描失败时会使用上述首选信道，热点仍会继续启动。
 
 ```sh
 # Linux
@@ -206,7 +217,7 @@ sudo journalctl -u sharewifi.service -f
 sudo systemctl disable --now sharewifi.service
 ```
 
-此安装方式下，`hostapd.conf`、`dnsmasq.conf`、`dnsmasq.leases`、`hostapd.log` 和 `dnsmasq.log` 都保存在 `/opt/shareWifi`。
+此安装方式下，`hostapd.conf`、当前 DHCP 后端的配置、租约和日志都保存在 `/opt/shareWifi`。使用 `dnsmasq` 时对应文件为 `dnsmasq.conf`、`dnsmasq.leases`、`dnsmasq.log`；使用 `udhcpd` 时对应文件为 `udhcpd.conf`、`udhcpd.leases`、`udhcpd.log`。
 
 ## 更多资料
 

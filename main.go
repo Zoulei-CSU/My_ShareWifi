@@ -34,7 +34,7 @@ var webFS embed.FS
 
 // Version is intentionally embedded in every binary so deployed instances can
 // be identified without starting the web service.
-const Version = "v0.1.12"
+const Version = "v0.1.13"
 
 // infoEnabled is immutable after flag parsing and controls diagnostic command tracing.
 var infoEnabled bool
@@ -338,9 +338,32 @@ func (a *app) channelScanAPI(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, http.StatusBadRequest, errors.New("请选择需要扫描的无线网卡"))
 		return
 	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.running && a.cfg != nil && a.cfg.Interface == iface {
+		jsonErr(w, http.StatusConflict, errors.New("当前无线网卡正在作为热点运行，驱动通常不允许在 AP 模式下扫描。请停止共享后再扫描，或选择另一块无线网卡。"))
+		return
+	}
 	if !contains(wirelessInterfaces(), iface) {
 		jsonErr(w, http.StatusBadRequest, fmt.Errorf("%s 不是当前可用的无线网卡", iface))
 		return
+	}
+	link, err := net.InterfaceByName(iface)
+	if err != nil {
+		jsonErr(w, http.StatusBadRequest, fmt.Errorf("无法读取无线网卡 %s 的状态：%w", iface, err))
+		return
+	}
+	wasUp := link.Flags&net.FlagUp != 0
+	if !wasUp {
+		if err := run("ip", "link", "set", "dev", iface, "up"); err != nil {
+			jsonErr(w, http.StatusBadRequest, fmt.Errorf("无法临时启用无线网卡 %s 以执行扫描：%w", iface, err))
+			return
+		}
+		defer func() {
+			if err := run("ip", "link", "set", "dev", iface, "down"); err != nil {
+				log.Printf("restore wireless interface down after channel scan: %v", err)
+			}
+		}()
 	}
 	out, err := commandCombinedOutput("iw", "dev", iface, "scan")
 	if err != nil {

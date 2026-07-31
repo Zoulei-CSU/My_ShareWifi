@@ -122,6 +122,14 @@ sudo ./sharewifi \
   -delay 30 \
   -workdir /var/lib/sharewifi \
   -listen 127.0.0.1:8080
+
+# 后台执行，不显示日志
+nohup sudo ./sharewifi-linux-amd64 \
+   -username user1 -password passwd \
+  -listen 0.0.0.0:8081 \
+  -workdir /path/to/workdir \
+  -config /path/to/config/sharewifi.json \
+  -delay 30 > /dev/null 2>&1 &
 ```
 
 延迟仅对 `-config` 生效，不影响网页中的手动“启动共享”。倒计时期间正常退出程序会取消尚未开始的热点创建。

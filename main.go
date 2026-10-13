@@ -34,7 +34,7 @@ var webFS embed.FS
 
 // Version is intentionally embedded in every binary so deployed instances can
 // be identified without starting the web service.
-const Version = "v0.1.13"
+const Version = "v0.1.14"
 
 // infoEnabled is immutable after flag parsing and controls diagnostic command tracing.
 var infoEnabled bool
@@ -226,7 +226,10 @@ func main() {
 		a.baseConfig = cfg
 		if startupDelay == 0 {
 			if err = a.start(cfg); err != nil {
-				log.Fatal(err)
+				// Keep the web console available when a configured USB adapter
+				// is temporarily absent; the user can retry after inserting it.
+				a.setLastError(err)
+				log.Printf("hotspot startup failed; web console remains available: %v", err)
 			}
 		} else {
 			delayedConfig = &cfg
@@ -260,6 +263,7 @@ func main() {
 			case <-timer.C:
 				log.Printf("delayed hotspot startup begins")
 				if err := a.start(cfg); err != nil {
+					a.setLastError(err)
 					log.Printf("delayed hotspot startup failed: %v", err)
 				}
 			case <-cancelDelayedStart:
@@ -420,11 +424,21 @@ func (a *app) startAPI(w http.ResponseWriter, r *http.Request) {
 		err = a.start(cfg)
 	}
 	if err != nil {
+		a.setLastError(err)
 		log.Printf("hotspot start request rejected: %v", err)
 		jsonErr(w, 400, err)
 		return
 	}
 	jsonOut(w, map[string]string{"message": "started"})
+}
+
+func (a *app) setLastError(err error) {
+	if err == nil {
+		return
+	}
+	a.mu.Lock()
+	a.lastError = err.Error()
+	a.mu.Unlock()
 }
 func (a *app) stopAPI(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {

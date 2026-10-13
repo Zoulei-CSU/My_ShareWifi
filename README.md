@@ -215,6 +215,8 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+如果开机时 USB 无线网卡尚未插入，程序会记录自动启动失败，但不会退出 Web 服务。插入网卡后刷新页面，确认网卡出现在列表中，再点击“启动共享”即可重试，因此不依赖 systemd 重启。`Restart=on-failure` 仍可作为程序发生未处理故障时的兜底机制。
+
 控制台认证可在 `ExecStart` 末尾增加 `-username 用户名 -password 密码`。若控制台监听在局域网地址，请设置认证或通过网络访问控制限制访问来源。
 
 ### 3. 启用、查看和停止服务
